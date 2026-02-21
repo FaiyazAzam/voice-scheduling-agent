@@ -64,6 +64,28 @@ function getOrCreateSession(req: any, res: any) {
   return { sessionId, session: sessions.get(sessionId)! };
 }
 
+function extractToolNameAndArgs(body: any): { name: string | null; args: any } {
+  // Your curl format
+  if (body?.name) return { name: body.name, args: body.arguments || {} };
+
+  // Common Vapi formats
+  const tc =
+    body?.message?.toolCalls?.[0] ||
+    body?.message?.tool_calls?.[0] ||
+    body?.toolCall ||
+    body?.tool_call ||
+    body?.tool;
+
+  const name = tc?.function?.name || tc?.name || body?.toolName || null;
+
+  let args = tc?.function?.arguments ?? tc?.arguments ?? body?.toolArguments ?? {};
+  if (typeof args === "string") {
+    try { args = JSON.parse(args); } catch { args = {}; }
+  }
+
+  return { name, args };
+}
+
 
 app.get("/auth/google", (req, res) => {
   // Always ensure a session exists + is registered
@@ -194,10 +216,11 @@ app.get("/session", (req, res) => {
 
 app.post("/vapi/tool", async (req, res) => {
   try {
-    const { name, arguments: args } = req.body || {};
+    const { name, args } = extractToolNameAndArgs(req.body);
 
     if (!name) {
-      return res.status(400).json({ error: "Missing tool name" });
+      console.log("Bad tool payload:", JSON.stringify(req.body));
+      return res.status(400).json({ ok: false, error: "Missing tool name" });
     }
 
     console.log("🔧 Tool call:", name, args);

@@ -12,35 +12,19 @@ app.use(cookieParser());
 
 const PORT = Number(process.env.PORT || 8080);
 
-// Very simple in-memory session store (we’ll replace/upgrade later if needed)
+// -----------------------------
+// Types + In-memory sessions
+// -----------------------------
 type SessionData = {
   createdAt: number;
-  googleTokens?: any; // we'll store OAuth tokens here
+  googleTokens?: any; // OAuth tokens
 };
 
 const sessions = new Map<string, SessionData>();
 
-function extractToolCall(body: any): { name: string; args: any } | null {
-  // Handles common shapes; Vapi sends tool calls inside messages/events.
-  const toolCall =
-    body?.message?.toolCalls?.[0] ||
-    body?.message?.tool_calls?.[0] ||
-    body?.toolCall ||
-    body?.tool_call;
-
-  const name = toolCall?.function?.name || toolCall?.name;
-  const rawArgs = toolCall?.function?.arguments || toolCall?.arguments;
-
-  if (!name) return null;
-
-  let args = rawArgs;
-  if (typeof rawArgs === "string") {
-    try { args = JSON.parse(rawArgs); } catch { args = {}; }
-  }
-
-  return { name, args };
-}
-
+// -----------------------------
+// Helpers
+// -----------------------------
 function makeOAuthClient() {
   const clientId = process.env.GOOGLE_CLIENT_ID!;
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET!;
@@ -49,12 +33,16 @@ function makeOAuthClient() {
 }
 
 function getOrCreateSession(req: any, res: any) {
-  let sessionId = req.cookies.sessionId as string | undefined;
+  let sessionId = req.cookies?.sessionId as string | undefined;
 
   if (!sessionId) {
     sessionId = nanoid();
     const secure = (process.env.PUBLIC_BASE_URL || "").startsWith("https://");
-    res.cookie("sessionId", sessionId, { httpOnly: true, sameSite: "lax", secure });
+    res.cookie("sessionId", sessionId, {
+      httpOnly: true,
+      sameSite: "lax",
+      secure,
+    });
   }
 
   if (!sessions.has(sessionId)) {
@@ -64,11 +52,36 @@ function getOrCreateSession(req: any, res: any) {
   return { sessionId, session: sessions.get(sessionId)! };
 }
 
+function getSessionFromReqOrArgs(req: any, res: any, args: any) {
+  // 1) Browser calls: cookie session
+  const cookieSid = req.cookies?.sessionId as string | undefined;
+
+  // 2) Vapi tool calls: pass sessionId explicitly in tool arguments
+  const argSid = (args?.sessionId as string | undefined) || undefined;
+
+  const sessionId = cookieSid || argSid;
+
+  if (!sessionId) {
+    // If there is no cookie, we won't create a new session automatically here,
+    // because tool calls should use an existing connected sessionId.
+    return { sessionId: null as string | null, session: null as SessionData | null };
+  }
+
+  // If cookieSid exists but session got wiped (restart), recreate minimal session container
+  if (!sessions.has(sessionId)) {
+    // Only recreate if it came from cookies; for argSid we expect it to exist
+    if (cookieSid) sessions.set(sessionId, { createdAt: Date.now() });
+    else return { sessionId, session: null as SessionData | null };
+  }
+
+  return { sessionId, session: sessions.get(sessionId)! };
+}
+
 function extractToolNameAndArgs(body: any): { name: string | null; args: any } {
-  // Your curl format
+  // Your curl format: { name, arguments }
   if (body?.name) return { name: body.name, args: body.arguments || {} };
 
-  // Common Vapi formats
+  // Common Vapi formats (varies by tool type / webhook flavor)
   const tc =
     body?.message?.toolCalls?.[0] ||
     body?.message?.tool_calls?.[0] ||
@@ -80,22 +93,61 @@ function extractToolNameAndArgs(body: any): { name: string | null; args: any } {
 
   let args = tc?.function?.arguments ?? tc?.arguments ?? body?.toolArguments ?? {};
   if (typeof args === "string") {
-    try { args = JSON.parse(args); } catch { args = {}; }
+    try {
+      args = JSON.parse(args);
+    } catch {
+      args = {};
+    }
   }
 
   return { name, args };
 }
 
+// Vapi expects a tool result payload; safest universal wrapper:
+function vapiResult(res: any, payload: any) {
+  return res.json({ result: payload });
+}
 
+function vapiError(res: any, status: number, payload: any) {
+  return res.status(status).json({ result: payload });
+}
+
+// Optional: request logging (helps debugging on Railway)
+app.use((req, _res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  next();
+});
+
+// -----------------------------
+// Routes: Health + Landing
+// -----------------------------
+app.get("/", (_req, res) => {
+  res.type("html").send(`
+    <h2>Voice Scheduling Agent Backend ✅</h2>
+    <ul>
+      <li><a href="/health">/health</a></li>
+      <li><a href="/auth/google">/auth/google</a></li>
+      <li><a href="/auth/status">/auth/status</a></li>
+    </ul>
+  `);
+});
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, service: "voice-scheduling-agent", time: new Date().toISOString() });
+});
+
+// -----------------------------
+// OAuth: Google Calendar
+// -----------------------------
 app.get("/auth/google", (req, res) => {
-  // Always ensure a session exists + is registered
+  // Ensure a session exists for the browser
   getOrCreateSession(req, res);
 
   const oauth2 = makeOAuthClient();
   const url = oauth2.generateAuthUrl({
     access_type: "offline",
     prompt: "consent",
-    scope: ["https://www.googleapis.com/auth/calendar"]
+    scope: ["https://www.googleapis.com/auth/calendar"],
   });
 
   res.redirect(url);
@@ -107,17 +159,17 @@ app.get("/auth/status", (req, res) => {
   res.json({
     sessionId,
     hasSession: true,
-    googleConnected: Boolean(session.googleTokens)
+    googleConnected: Boolean(session.googleTokens),
   });
 });
 
 app.get("/auth/google/callback", async (req, res) => {
   try {
     const code = String(req.query.code || "");
-    const sessionId = req.cookies.sessionId as string | undefined;
+    const sessionId = req.cookies?.sessionId as string | undefined;
 
     if (!sessionId || !sessions.has(sessionId)) {
-      return res.status(400).send("No session cookie. Start at /session.");
+      return res.status(400).send("No session cookie. Start at /auth/google.");
     }
     if (!code) {
       return res.status(400).send("Missing code.");
@@ -139,17 +191,30 @@ app.get("/auth/google/callback", async (req, res) => {
   }
 });
 
-app.post("/vapi/webhook", async (req, res) => {
-  const extracted = extractToolCall(req.body);
-  if (!extracted) {
-    return res.json({ ok: true, note: "No tool call found" });
+// Kept for compatibility with your earlier flow
+app.get("/session", (req, res) => {
+  const existing = req.cookies?.sessionId as string | undefined;
+  if (existing && sessions.has(existing)) {
+    return res.json({ sessionId: existing });
   }
 
-  // Reuse your existing tool handler logic by calling the same switch:
-  req.body = { name: extracted.name, arguments: extracted.args };
-  return app._router.handle(req, res, () => {});
+  const sessionId = nanoid();
+  sessions.set(sessionId, { createdAt: Date.now() });
+
+  const secure = (process.env.PUBLIC_BASE_URL || "").startsWith("https://");
+
+  res.cookie("sessionId", sessionId, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure,
+  });
+
+  res.json({ sessionId });
 });
 
+// -----------------------------
+// Debug: create an event (browser cookie session only)
+// -----------------------------
 app.get("/debug/create-event", async (req, res) => {
   try {
     const { session } = getOrCreateSession(req, res);
@@ -170,80 +235,56 @@ app.get("/debug/create-event", async (req, res) => {
       summary: "Voice Agent Test Event",
       description: "Created from /debug/create-event endpoint",
       start: { dateTime: start.toISOString() },
-      end: { dateTime: end.toISOString() }
+      end: { dateTime: end.toISOString() },
     };
 
     const result = await calendar.events.insert({
       calendarId: "primary",
-      requestBody: event
+      requestBody: event,
     });
 
     res.json({
       ok: true,
       eventId: result.data.id,
       htmlLink: result.data.htmlLink,
-      summary: result.data.summary
+      summary: result.data.summary,
     });
   } catch (e: any) {
     res.status(500).json({ ok: false, error: e?.message || "unknown error" });
   }
 });
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "voice-scheduling-agent", time: new Date().toISOString() });
-});
-
-app.get("/session", (req, res) => {
-  const existing = req.cookies.sessionId as string | undefined;
-  if (existing && sessions.has(existing)) {
-    return res.json({ sessionId: existing });
-  }
-
-  const sessionId = nanoid();
-  sessions.set(sessionId, { createdAt: Date.now() });
-
-  // In prod (https) set secure: true. For localhost keep it false.
-  const secure = (process.env.PUBLIC_BASE_URL || "").startsWith("https://");
-
-  res.cookie("sessionId", sessionId, {
-    httpOnly: true,
-    sameSite: "lax",
-    secure
-  });
-
-  res.json({ sessionId });
-});
-
+// -----------------------------
+// Vapi Tool Endpoint
+// -----------------------------
 app.post("/vapi/tool", async (req, res) => {
   try {
     const { name, args } = extractToolNameAndArgs(req.body);
 
     if (!name) {
       console.log("Bad tool payload:", JSON.stringify(req.body));
-      return res.status(400).json({ ok: false, error: "Missing tool name" });
+      return vapiError(res, 400, { ok: false, error: "Missing tool name" });
     }
 
     console.log("🔧 Tool call:", name, args);
+    console.log("Incoming cookies:", req.headers.cookie || "(none)");
 
-    // We will implement handlers next
     switch (name) {
       case "create_calendar_event": {
-        const { session } = getOrCreateSession(req, res);
+        const { sessionId, session } = getSessionFromReqOrArgs(req, res, args);
 
-        if (!session.googleTokens) {
-            return res.status(401).json({
+        if (!session?.googleTokens) {
+          return vapiError(res, 401, {
             ok: false,
-            message: "User has not connected Google Calendar"
-            });
+            message: "User has not connected Google Calendar",
+            sessionId,
+          });
         }
 
         const { attendeeName, title, startISO, endISO } = args || {};
 
         if (!startISO || !endISO) {
-            return res.status(400).json({
-            ok: false,
-            message: "Missing startISO or endISO"
-            });
+          return vapiError(res, 400, { ok: false, message: "Missing startISO or endISO" });
         }
 
         const oauth2 = makeOAuthClient();
@@ -252,41 +293,39 @@ app.post("/vapi/tool", async (req, res) => {
         const calendar = google.calendar({ version: "v3", auth: oauth2 });
 
         const event = {
-            summary: title || `Meeting with ${attendeeName || "guest"}`,
-            description: "Scheduled via voice agent",
-            start: { dateTime: startISO },
-            end: { dateTime: endISO }
+          summary: title || `Meeting with ${attendeeName || "guest"}`,
+          description: "Scheduled via voice agent",
+          start: { dateTime: startISO },
+          end: { dateTime: endISO },
         };
 
         const result = await calendar.events.insert({
-            calendarId: "primary",
-            requestBody: event
+          calendarId: "primary",
+          requestBody: event,
         });
 
-        return res.json({
-            ok: true,
-            eventId: result.data.id,
-            htmlLink: result.data.htmlLink,
-            summary: result.data.summary
+        return vapiResult(res, {
+          ok: true,
+          eventId: result.data.id,
+          htmlLink: result.data.htmlLink,
+          summary: result.data.summary,
         });
-        }
+      }
 
-      case "check_availability":{
-        const { session } = getOrCreateSession(req, res);
+      case "check_availability": {
+        const { sessionId, session } = getSessionFromReqOrArgs(req, res, args);
 
-        if (!session.googleTokens) {
-          return res.status(401).json({
+        if (!session?.googleTokens) {
+          return vapiError(res, 401, {
             ok: false,
-            message: "User has not connected Google Calendar"
+            message: "User has not connected Google Calendar",
+            sessionId,
           });
         }
+
         const { startISO, endISO } = args || {};
-
         if (!startISO || !endISO) {
-          return res.status(400).json({
-            ok: false,
-            message: "Missing startISO or endISO"
-          });
+          return vapiError(res, 400, { ok: false, message: "Missing startISO or endISO" });
         }
 
         const oauth2 = makeOAuthClient();
@@ -298,100 +337,87 @@ app.post("/vapi/tool", async (req, res) => {
           requestBody: {
             timeMin: startISO,
             timeMax: endISO,
-            items: [{ id: "primary" }]
-          }
+            items: [{ id: "primary" }],
+          },
         });
 
         const busy = fb.data.calendars?.primary?.busy || [];
-
-        return res.json({
-          ok: true,
-          available: busy.length === 0,
-          busySlots: busy
-        });
+        return vapiResult(res, { ok: true, available: busy.length === 0, busySlots: busy });
       }
 
       case "suggest_alternatives": {
-      const { session } = getOrCreateSession(req, res);
+        const { sessionId, session } = getSessionFromReqOrArgs(req, res, args);
 
-      if (!session.googleTokens) {
-        return res.status(401).json({
-          ok: false,
-          message: "User has not connected Google Calendar"
-        });
-      }
-
-      const { dateISO, durationMinutes } = args || {};
-      const dur = Number(durationMinutes || 30);
-
-      if (!dateISO) {
-        return res.status(400).json({
-          ok: false,
-          message: "Missing dateISO (YYYY-MM-DD)"
-        });
-      }
-      if (!Number.isFinite(dur) || dur <= 0) {
-        return res.status(400).json({
-          ok: false,
-          message: "Invalid durationMinutes"
-        });
-      }
-
-      const oauth2 = makeOAuthClient();
-      oauth2.setCredentials(session.googleTokens);
-      const calendar = google.calendar({ version: "v3", auth: oauth2 });
-
-      // Build a set of candidate time windows in UTC for simplicity.
-      // We scan 9:00–17:00, step 30 minutes.
-      const suggestions: Array<{ startISO: string; endISO: string }> = [];
-
-      // Interpret dateISO as a date, create UTC day boundaries
-      const dayStart = new Date(`${dateISO}T00:00:00Z`);
-
-      // 09:00 UTC to 17:00 UTC (simple demo; later we’ll do timezone properly)
-      const startMin = 9 * 60;
-      const endMin = 17 * 60;
-      const step = 30;
-
-      for (let t = startMin; t + dur <= endMin; t += step) {
-        const start = new Date(dayStart.getTime() + t * 60 * 1000);
-        const end = new Date(start.getTime() + dur * 60 * 1000);
-
-        // Stop early if we already have 2 suggestions
-        if (suggestions.length >= 2) break;
-
-        const fb = await calendar.freebusy.query({
-          requestBody: {
-            timeMin: start.toISOString(),
-            timeMax: end.toISOString(),
-            items: [{ id: "primary" }]
-          }
-        });
-
-        const busy = fb.data.calendars?.primary?.busy || [];
-        if (busy.length === 0) {
-          suggestions.push({ startISO: start.toISOString(), endISO: end.toISOString() });
+        if (!session?.googleTokens) {
+          return vapiError(res, 401, {
+            ok: false,
+            message: "User has not connected Google Calendar",
+            sessionId,
+          });
         }
-      }
 
-      return res.json({
-        ok: true,
-        suggestions,
-        message:
-          suggestions.length > 0
-            ? "Found available times."
-            : "No availability found in working hours."
-      });
-    }
+        const { dateISO, durationMinutes } = args || {};
+        const dur = Number(durationMinutes || 30);
+
+        if (!dateISO) {
+          return vapiError(res, 400, { ok: false, message: "Missing dateISO (YYYY-MM-DD)" });
+        }
+        if (!Number.isFinite(dur) || dur <= 0) {
+          return vapiError(res, 400, { ok: false, message: "Invalid durationMinutes" });
+        }
+
+        const oauth2 = makeOAuthClient();
+        oauth2.setCredentials(session.googleTokens);
+        const calendar = google.calendar({ version: "v3", auth: oauth2 });
+
+        // Demo scan: 09:00–17:00 UTC, step 30 minutes. (Later: timezone-aware)
+        const suggestions: Array<{ startISO: string; endISO: string }> = [];
+        const dayStart = new Date(`${dateISO}T00:00:00Z`);
+
+        const startMin = 9 * 60;
+        const endMin = 17 * 60;
+        const step = 30;
+
+        for (let t = startMin; t + dur <= endMin; t += step) {
+          if (suggestions.length >= 2) break;
+
+          const start = new Date(dayStart.getTime() + t * 60 * 1000);
+          const end = new Date(start.getTime() + dur * 60 * 1000);
+
+          const fb = await calendar.freebusy.query({
+            requestBody: {
+              timeMin: start.toISOString(),
+              timeMax: end.toISOString(),
+              items: [{ id: "primary" }],
+            },
+          });
+
+          const busy = fb.data.calendars?.primary?.busy || [];
+          if (busy.length === 0) {
+            suggestions.push({ startISO: start.toISOString(), endISO: end.toISOString() });
+          }
+        }
+
+        return vapiResult(res, {
+          ok: true,
+          suggestions,
+          message:
+            suggestions.length > 0 ? "Found available times." : "No availability found in working hours.",
+        });
+      }
 
       default:
-        return res.status(400).json({ error: "Unknown tool" });
+        return vapiError(res, 400, { ok: false, error: "Unknown tool", name });
     }
   } catch (e: any) {
-    res.status(500).json({ error: e?.message || "Tool handler error" });
+    console.error("Tool handler error:", e);
+    return vapiError(res, 500, { ok: false, error: e?.message || "Tool handler error" });
   }
 });
 
+// -----------------------------
+// Start
+// -----------------------------
 app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
